@@ -1,0 +1,175 @@
+# ## Code is unfortunately not functional at the moment, but is a work in progress!
+
+from pyo import *
+import time, sys, threading, mido
+
+try:
+    DeviceNumber = int(12)
+    #s.amp = 0.1 # volume
+    s = Server(duplex=0)
+    s.setOutputDevice(DeviceNumber)
+    s.setBufferSize(256)
+    s.boot() #starts audio engine
+    
+    midi = Notein()
+
+    attack = Sig(0.01)
+    decay = Sig(0.1)
+    sustain = Sig(0.7)
+    release = Sig(0.5)
+    cutoff = Sig(2000)
+    
+    osc_type = "sine" # "sine", "saw", "square"
+    active_notes = {}
+    
+    def create_oscillator(freq, velocity):
+        if osc_type == "sine":
+            return Sine(freq=freq, mul=velocity / 127.0)
+        elif osc_type == "saw":
+            return LFO(freq=freq, type=1, mul=velocity / 127.0)
+        elif osc_type == "square":
+            return Square(freq=freq, mul=velocity / 127.0)
+        else:
+            return Sine(freq=freq, mul=velocity / 127.0) # Default
+    
+    def handle_key(status, note, velocity):
+        if status == 144 and velocity > 0 and note not in active_notes: # Key pressed (new note)
+            freq = midiToHz(note) # Converts MIDI to Hz
+            # Oscillator 
+            vel = max(velocity / 127.0, 0.01)
+            osc = create_oscillator(freq, vel)
+
+            # Filter -> Osc.
+            filtered = Tone(osc, freq=cutoff)
+
+            # Env. -> filtered sound
+            env = Adsr(
+                attack=float(attack.value),
+                decay=float(decay.value),
+                sustain=float(sustain.value),
+                release=float(release.value),
+                dur=0,
+                mul=1.0
+            )
+            
+            gain = 0.6 # Master volm.
+            filtered.mul = env * gain
+            filtered.out()
+
+            # Store
+            active_notes[note] = (osc, env)
+            env.play()
+
+            print(f"Playing note {note} at {freq:.1f} Hz") # REMOVE AFTER COMPLETION
+        
+        elif (status == 128 or (status == 144 and velocity == 0))and note in active_notes: # Key released
+            osc, env = active_notes[note]
+            env.stop() # Trigger release
+            del active_notes[note]
+            print(f"Released note {note}")
+
+    s.start()
+    def mido_worker(port_name):
+        print("Opening MIDI port:", port_name)
+        try:
+            with mido.open_input(port_name) as inport:
+                for msg in inport:
+                    if msg.type == 'note_on' and msg.velocity > 0:
+                        handle_key(144, msg.note, msg.velocity)
+                    elif msg.type == 'note_off' or (msg.type == 'note_on' and msg.velocity == 0):
+                        handle_key(128, msg.note, msg.velocity)
+        except Exception as e:
+            print("Error opening/reading MIDI port:", e)
+
+    # Pick the correct port auto.
+    ports = mido.get_input_names()
+    print("MIDI input ports detected by mido:")
+    for i, nm in enumerate(ports):
+        print(f"{i}: {nm}")
+
+    # Try to find the USB keyboard by substring; adjust this string if your device has a different name.
+    preferred_substrs = ["USB MIDI Interface", "USB", "MIDI"]  # order of preference
+    usb_port = None
+    for nm in ports:
+        for sub in preferred_substrs:
+            if sub in nm:
+                # Prefer the explicit USB MIDI Interface seen in your earlier output
+                if "USB MIDI Interface" in nm or usb_port is None:
+                    usb_port = nm
+                    break
+        if usb_port and "USB MIDI Interface" in usb_port:
+            break
+
+    if usb_port is None:
+        print("No matching USB MIDI port found. Select one from the printed list and update the script.")
+        sys.exit(1)
+    
+    # Start mido thread (daemon so program can exit cleanly)
+    threading.Thread(target=mido_worker, args=(usb_port,), daemon=True).start()
+
+    # Knobs menue
+    def adjust_knobs():
+        global osc_type
+
+        while True:
+            print("\n" + "="*50)
+            print("CURRENT KNOB VALUES:")
+            print(f"1. Attack: {attack.value:.3f}")
+            print(f"2. Decay: {decay.value:.3f}")
+            print(f"3. Sustain: {sustain.value:.3f}")
+            print(f"4. Release: {release.value:.3f}")
+            print(f"5. Filter Cutoff: {cutoff.value} Hz")
+            print(f"6. Oscillator Type: {osc_type.upper()}")
+            print(f"7. Quit")
+            print("="*50)
+
+            choice = input("\nWhich knob to adjust? (1-7): ")
+            
+            if choice == '1':
+                val = float(input("New Attack (0.001-2.0): "))
+                attack.value = val
+                print (f"Attack set to {val}")
+            elif choice == '2':
+                val = float(input("New Decay (0.01-2.0): "))
+                decay.value = val
+                print(f"Decay set to {val}")
+            elif choice == '3':
+                val = float(input("New Sustain (0.0-1.0): "))
+                sustain.value = val
+                print(f"Sustain set to {val}")
+            elif choice == '4':
+                val = float(input("New Release (0.01-5.0): "))
+                release.value = val
+                print(f"Release set to {val}")
+            elif choice == '5':
+                val = float(input("New Filter Cutoff (200-8000 Hz): "))
+                cutoff.value = val
+                print(f"Filter set to {val} Hz")
+            elif choice == '6':
+                print("\nOscillator Types:\n  sine  - Smooth, pure tone\n  saw  - Bright, buzzy\n  square  - Hollow, retro")
+                new_type = input("Choose (sine/saw/square): ").lower()
+                if new_type in ["sine", "saw", "square"]:
+                    osc_type = new_type
+                    print(f"Osc. type changed to [osc_type]")
+                else:
+                    print("Invalid type!")
+            elif choice == '7':
+                print("Quitting...")
+                s.stop()
+                sys.exit(0)
+            else:
+                print("< Invalid choice >")
+    
+    # Run knob adjustment in a separate thread so MIDI still works
+    knob_thread = threading.Thread(target=adjust_knobs, daemon=True)
+    knob_thread.start()
+    
+    print(f"Filter cutoff: {cutoff} Hz")
+    while True:
+        time.sleep(1) # Keeps program running
+
+except (EOFError, KeyboardInterrupt):
+    print("\nStopping...")
+    s.stop()
+    sys.exit(0)
+
